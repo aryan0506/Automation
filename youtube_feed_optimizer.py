@@ -14,24 +14,131 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
 import google.generativeai as genai
+import requests
+import json
 
 class YouTubeFeedOptimizer:
-    def __init__(self, gemini_api_key):
+    def __init__(self, config):
+        self.config = config
         self.setup_logging()
-        self.setup_gemini(gemini_api_key)
+        self.setup_llm()
         self.setup_driver()
         self.api_call_count = 0
         self.last_api_call = 0
         self.premium_searches_done = set()
+        self.generated_searches = []
         
     def setup_logging(self):
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
         self.logger = logging.getLogger(__name__)
         
-    def setup_gemini(self, api_key):
-        self.logger.info("Setting up Gemini API")
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-1.5-flash')
+    def setup_llm(self):
+        """Setup LLM providers based on configuration"""
+        self.logger.info(f"Setting up LLM provider: {self.config.LLM_PROVIDER}")
+        
+        # Setup Gemini if needed
+        if self.config.LLM_PROVIDER in ["gemini", "both"]:
+            try:
+                genai.configure(api_key=self.config.GEMINI_API_KEY)
+                self.gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+                self.logger.info("Gemini API configured successfully")
+            except Exception as e:
+                self.logger.error(f"Gemini setup failed: {e}")
+                if self.config.LLM_PROVIDER == "gemini":
+                    raise Exception("Gemini setup failed and no fallback configured")
+        
+        # Setup Ollama if needed
+        if self.config.LLM_PROVIDER in ["ollama", "both"]:
+            try:
+                # Test Ollama connection
+                response = requests.get(f"{self.config.OLLAMA_BASE_URL}/api/tags", timeout=5)
+                if response.status_code == 200:
+                    self.logger.info("Ollama API connected successfully")
+                else:
+                    raise Exception(f"Ollama API returned status {response.status_code}")
+            except Exception as e:
+                self.logger.error(f"Ollama setup failed: {e}")
+                if self.config.LLM_PROVIDER == "ollama":
+                    raise Exception("Ollama setup failed and no fallback configured")
+    
+    def call_ollama_api(self, prompt):
+        """Call Ollama API for text generation"""
+        try:
+            payload = {
+                "model": self.config.OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.1,
+                    "top_p": 0.9,
+                    "max_tokens": 150
+                }
+            }
+            
+            response = requests.post(
+                f"{self.config.OLLAMA_BASE_URL}/api/generate",
+                json=payload,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                return result.get("response", "").strip()
+            else:
+                raise Exception(f"Ollama API error: {response.status_code}")
+                
+        except Exception as e:
+            self.logger.error(f"Ollama API call failed: {e}")
+            raise
+    
+    def call_gemini_api(self, prompt):
+        """Call Gemini API for text generation"""
+        try:
+            response = self.gemini_model.generate_content(prompt)
+            return response.text.strip()
+        except Exception as e:
+            self.logger.error(f"Gemini API call failed: {e}")
+            raise
+    
+    def generate_elite_search_terms(self):
+        """Generate intelligent search terms using LLM"""
+        if len(self.generated_searches) >= 5:  # Limit to avoid too many searches
+            return []
+            
+        prompt = """Generate 2 highly specific YouTube search terms to find TOP 1% elite content in:
+- Advanced skill mastery (not basic tutorials)
+- Wealth building strategies from successful entrepreneurs
+- Health optimization from medical experts
+- Productivity systems from peak performers
+- Mental models from world-class thinkers
+
+Focus on:
+- Content normally behind paywalls
+- Expert-level insights
+- Advanced methodologies
+- Exclusive knowledge
+
+Return only 2 search terms, one per line, no explanations."""
+
+        try:
+            if self.config.LLM_PROVIDER == "gemini":
+                response = self.call_gemini_api(prompt)
+            elif self.config.LLM_PROVIDER == "ollama":
+                response = self.call_ollama_api(prompt)
+            elif self.config.LLM_PROVIDER == "both":
+                try:
+                    response = self.call_gemini_api(prompt)
+                except:
+                    response = self.call_ollama_api(prompt)
+            
+            # Parse response into search terms
+            search_terms = [term.strip() for term in response.split('\n') if term.strip()][:2]
+            self.generated_searches.extend(search_terms)
+            return search_terms
+            
+        except Exception as e:
+            self.logger.error(f"Failed to generate search terms: {e}")
+            return []
     
     def kill_chrome_processes(self):
         """Kill existing Chrome processes using the profile"""
@@ -132,51 +239,128 @@ class YouTubeFeedOptimizer:
         """Implement rate limiting to avoid API throttling"""
         current_time = time.time()
         
-        # Gemini API free tier: 15 requests per minute
-        if self.api_call_count >= 10:  # Conservative limit
-            time_since_first_call = current_time - self.last_api_call
-            if time_since_first_call < 60:  # Within 1 minute
-                sleep_time = 60 - time_since_first_call + 5  # Extra 5 seconds buffer
-                self.logger.info(f"Rate limit protection: sleeping {sleep_time:.1f} seconds")
-                time.sleep(sleep_time)
-                self.api_call_count = 0
+        # Rate limiting for Gemini API
+        if self.config.LLM_PROVIDER in ["gemini", "both"]:
+            if self.api_call_count >= 10:  # Conservative limit
+                time_since_first_call = current_time - self.last_api_call
+                if time_since_first_call < 60:  # Within 1 minute
+                    sleep_time = 60 - time_since_first_call + 5  # Extra 5 seconds buffer
+                    self.logger.info(f"Rate limit protection: sleeping {sleep_time:.1f} seconds")
+                    time.sleep(sleep_time)
+                    self.api_call_count = 0
         
         self.api_call_count += 1
         self.last_api_call = current_time
         
-    def analyze_video_content(self, title, channel):
+    def analyze_video_content(self, title, channel, duration=None, views=None, description=None):
+        """Analyze video content using enhanced metadata and strict criteria"""
         # Rate limiting protection
         self.rate_limit_protection()
         
-        prompt = f"""Rate this YouTube content from 1-10 for educational/productivity value:
-Title: {title}
-Channel: {channel}
-
-SPECIAL BONUS SCORING:
-- Premium course content available free on YouTube: 10/10
-- Paid tutorial/masterclass content shared free: 9-10/10
-- Professional skills training normally behind paywall: 9-10/10
-
-REGULAR SCORING:
-- Educational tutorials, documentaries, skill-building: 7-8/10
-- News, tech reviews with learning value: 6-7/10
-- Entertainment with some educational aspect: 5-6/10
-- Clickbait, drama, mindless content: 1-4/10
-
-Look for keywords like: "full course", "masterclass", "complete tutorial", "premium", "paid course free", "bootcamp", "certification"
-
-Respond with just a number 1-10."""
+        # Build context with available metadata
+        context = f"Title: {title}\nChannel: {channel}"
+        if duration:
+            context += f"\nDuration: {duration}"
+        if views:
+            context += f"\nViews: {views}"
+        if description:
+            context += f"\nDescription: {description[:200]}..."
         
+        prompt = f"""Analyze this YouTube content for ELITE educational/productivity value:
+
+{context}
+
+STRICT SCORING CRITERIA (Rate 1-10):
+
+🏆 TIER 1 (9-10/10) - WORLD-CLASS ELITE:
+- Billionaire/CEO sharing actual business strategies
+- Medical doctors/PhDs sharing advanced knowledge
+- Premium courses ($500+) available free
+- Advanced technical skills (programming, finance, etc.)
+- Proven experts with real credentials
+
+🎯 TIER 2 (7-8/10) - HIGH-VALUE PROFESSIONAL:
+- Successful entrepreneurs with track record
+- Professional certification content
+- Advanced tutorials requiring prior knowledge
+- Evidence-based health/fitness optimization
+- Productivity systems from high achievers
+
+⚡ TIER 3 (5-6/10) - DECENT LEARNING:
+- General educational content
+- Basic skill tutorials with good structure
+- Informative news/analysis
+
+❌ TIER 4 (1-4/10) - LOW VALUE:
+- Music videos, songs, entertainment
+- Clickbait, drama, gossip, reactions
+- Mindless content, memes, shorts
+- Basic lifestyle vlogs
+- Gaming content (unless educational)
+
+CRITICAL RULES:
+- Music/songs = automatic 1-3/10 (entertainment, not educational)
+- Entertainment content = 1-4/10 maximum
+- Look for ACTUAL expertise and credentials
+- Prioritize actionable, advanced knowledge
+- Consider video length (longer often = more depth)
+
+Respond with: SCORE|REASON
+Example: 8|Advanced programming tutorial from Google engineer with 10+ years experience
+Example: 2|Music video - pure entertainment with no educational value"""
+        
+        # Try primary provider first
+        if self.config.LLM_PROVIDER == "gemini":
+            return self._analyze_with_gemini(prompt)
+        elif self.config.LLM_PROVIDER == "ollama":
+            return self._analyze_with_ollama(prompt)
+        elif self.config.LLM_PROVIDER == "both":
+            # Try Gemini first, fallback to Ollama
+            try:
+                return self._analyze_with_gemini(prompt)
+            except Exception as e:
+                self.logger.warning(f"Gemini failed, trying Ollama: {e}")
+                return self._analyze_with_ollama(prompt)
+    
+    def _analyze_with_gemini(self, prompt):
+        """Analyze using Gemini API"""
         try:
-            response = self.model.generate_content(prompt)
-            score_text = response.text.strip()
-            score = int(''.join(filter(str.isdigit, score_text))[:1] or '5')
-            return max(1, min(10, score)), score_text
+            response_text = self.call_gemini_api(prompt)
+            return self._parse_analysis_response(response_text)
         except Exception as e:
-            self.logger.error(f"Analysis failed: {e}")
-            # Exponential backoff on API errors
+            self.logger.error(f"Gemini analysis failed: {e}")
             time.sleep(random.uniform(5, 10))
-            return 5, "Analysis failed"
+            raise
+    
+    def _analyze_with_ollama(self, prompt):
+        """Analyze using Ollama API"""
+        try:
+            response_text = self.call_ollama_api(prompt)
+            return self._parse_analysis_response(response_text)
+        except Exception as e:
+            self.logger.error(f"Ollama analysis failed: {e}")
+            time.sleep(random.uniform(2, 5))
+            raise
+    
+    def _parse_analysis_response(self, response_text):
+        """Parse the LLM response to extract score and reason"""
+        try:
+            if '|' in response_text:
+                parts = response_text.split('|', 1)
+                score_text = parts[0].strip()
+                reason = parts[1].strip() if len(parts) > 1 else "No reason provided"
+            else:
+                score_text = response_text.strip()
+                reason = "Analysis completed"
+            
+            # Extract numeric score
+            score = int(''.join(filter(str.isdigit, score_text))[:1] or '5')
+            score = max(1, min(10, score))
+            
+            return score, reason
+        except Exception as e:
+            self.logger.error(f"Failed to parse analysis response: {e}")
+            return 5, "Parsing failed"
     
     def search_premium_content(self, search_terms):
         """Search for premium content and interact with results"""
@@ -186,7 +370,7 @@ Respond with just a number 1-10."""
         self.premium_searches_done.add(search_terms)
         
         try:
-            self.logger.info(f"Searching for premium content: {search_terms}")
+            self.logger.info(f"Searching for elite content: {search_terms}")
             
             # Multiple search box selectors
             search_selectors = [
@@ -265,10 +449,17 @@ Respond with just a number 1-10."""
                     if not title:
                         continue
                     
-                    # Check if it's premium content
-                    premium_keywords = ['full course', 'complete', 'masterclass', 'free course', 'bootcamp', 'certification', 'tutorial series']
-                    if any(keyword in title.lower() for keyword in premium_keywords):
-                        self.logger.info(f"Found premium content: {title[:50]}...")
+                    # Check if it's elite content using enhanced keywords
+                    elite_keywords = [
+                        'masterclass', 'full course', 'complete guide', 'advanced', 'expert',
+                        'billionaire', 'millionaire', 'ceo secrets', 'insider', 'exclusive',
+                        'harvard', 'stanford', 'mit', 'phd', 'professor', 'research',
+                        'optimization', 'biohacking', 'longevity', 'peak performance',
+                        'mental models', 'frameworks', 'systems', 'strategies'
+                    ]
+                    
+                    if any(keyword in title.lower() for keyword in elite_keywords):
+                        self.logger.info(f"Found elite content: {title[:50]}...")
                         
                         # Click the video
                         self.driver.execute_script("arguments[0].click();", title_elem)
@@ -287,7 +478,7 @@ Respond with just a number 1-10."""
                                     EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
                                 )
                                 like_btn.click()
-                                self.logger.info("Liked premium content")
+                                self.logger.info("Liked elite content")
                                 time.sleep(2)
                                 break
                             except:
@@ -307,7 +498,7 @@ Respond with just a number 1-10."""
             time.sleep(3)
             
         except Exception as e:
-            self.logger.error(f"Premium search failed: {e}")
+            self.logger.error(f"Elite search failed: {e}")
             # Return to home on any error
             try:
                 self.driver.get("https://www.youtube.com")
@@ -336,6 +527,7 @@ Respond with just a number 1-10."""
             return []
     
     def extract_video_info(self, video_element):
+        """Extract comprehensive video information including metadata"""
         try:
             title_selectors = [
                 "#video-title",
@@ -353,6 +545,7 @@ Respond with just a number 1-10."""
                 "[href*='/@']"
             ]
             
+            # Extract title
             title = None
             title_elem = None
             
@@ -365,6 +558,7 @@ Respond with just a number 1-10."""
                 except:
                     continue
             
+            # Extract channel
             channel = None
             for selector in channel_selectors:
                 try:
@@ -375,6 +569,41 @@ Respond with just a number 1-10."""
                 except:
                     continue
             
+            # Extract duration
+            duration = None
+            duration_selectors = [
+                ".ytd-thumbnail-overlay-time-status-renderer",
+                "#overlays .badge-shape-wiz__text",
+                "span.style-scope.ytd-thumbnail-overlay-time-status-renderer"
+            ]
+            
+            for selector in duration_selectors:
+                try:
+                    duration_elem = video_element.find_element(By.CSS_SELECTOR, selector)
+                    duration = duration_elem.text.strip()
+                    if duration:
+                        break
+                except:
+                    continue
+            
+            # Extract view count
+            views = None
+            view_selectors = [
+                "#metadata-line span:first-child",
+                ".inline-metadata-item:first-child",
+                "span[aria-label*='views']"
+            ]
+            
+            for selector in view_selectors:
+                try:
+                    views_elem = video_element.find_element(By.CSS_SELECTOR, selector)
+                    views = views_elem.text.strip()
+                    if 'view' in views.lower():
+                        break
+                except:
+                    continue
+            
+            # Fallback for title
             if not title:
                 try:
                     all_text = video_element.text
@@ -388,12 +617,18 @@ Respond with just a number 1-10."""
                 channel = "Unknown Channel"
             
             if title and title.strip():
-                return title.strip(), channel.strip(), title_elem
+                return {
+                    'title': title.strip(),
+                    'channel': channel.strip(),
+                    'duration': duration,
+                    'views': views,
+                    'title_elem': title_elem
+                }
             else:
-                return None, None, None
+                return None
                 
         except Exception as e:
-            return None, None, None
+            return None
     
     def interact_with_video(self, video_element, action):
         try:
@@ -511,15 +746,21 @@ Respond with just a number 1-10."""
             self.logger.info("Please log into YouTube manually")
             input("Press Enter after logging in...")
         
-        # Search for premium content first
-        premium_searches = [
-            "free full course programming",
-            "complete masterclass free"
-        ]
+        # Generate intelligent search terms using LLM
+        print("🧠 Generating elite search terms using AI...")
+        elite_searches = self.generate_elite_search_terms()
         
-        for search_term in premium_searches:
-            self.search_premium_content(search_term)
-            time.sleep(5)
+        if elite_searches:
+            print(f"🎯 Generated searches: {elite_searches}")
+            for search_term in elite_searches:
+                self.search_premium_content(search_term)
+                time.sleep(5)
+        else:
+            print("⚠️ Using fallback searches...")
+            fallback_searches = ["advanced wealth building strategies", "elite productivity systems"]
+            for search_term in fallback_searches:
+                self.search_premium_content(search_term)
+                time.sleep(5)
         
         processed = 0
         scroll_count = 0
@@ -542,43 +783,60 @@ Respond with just a number 1-10."""
                 processed_elements.add(video_id)
                 new_videos_found = True
                     
-                title, channel, title_elem = self.extract_video_info(video)
-                if not title or len(title.strip()) < 5:
+                video_info = self.extract_video_info(video)
+                if not video_info or len(video_info['title'].strip()) < 5:
                     continue
                 
-                print(f"\nAnalyzing: {title[:60]}...")
-                print(f"Channel: {channel}")
+                print(f"\nAnalyzing: {video_info['title'][:60]}...")
+                print(f"Channel: {video_info['channel']}")
+                if video_info['duration']:
+                    print(f"Duration: {video_info['duration']}")
+                if video_info['views']:
+                    print(f"Views: {video_info['views']}")
                 
-                score, reason = self.analyze_video_content(title, channel)
-                print(f"Score: {score}/10")
-                
-                # Special handling for premium content
-                if score == 10:
-                    print("🎯 PREMIUM CONTENT - Liking and engaging!")
-                    self.interact_with_video(video, "like")
-                elif score >= 7:
-                    print("✓ High quality - Liking video")
-                    self.interact_with_video(video, "like")
-                elif score <= 4:
-                    print("✗ Low quality - Marking not interested")
-                    self.interact_with_video(video, "not_interested")
-                else:
-                    print("~ Neutral - No action")
+                try:
+                    score, reason = self.analyze_video_content(
+                        video_info['title'], 
+                        video_info['channel'],
+                        video_info['duration'],
+                        video_info['views']
+                    )
+                    
+                    print(f"💡 Reason: {reason}")
+                    
+                    # Enhanced feedback based on elite scoring
+                    if score >= 9:
+                        print(f"🏆 ELITE TIER 1 ({score}/10) - World-class content!")
+                        self.interact_with_video(video, "like")
+                    elif score >= 7:
+                        print(f"🎯 HIGH-VALUE ({score}/10) - Professional level content")
+                        self.interact_with_video(video, "like")
+                    elif score >= 5:
+                        print(f"⚡ DECENT ({score}/10) - Some learning value")
+                        print("~ Neutral - No action")
+                    else:
+                        print(f"❌ LOW-VALUE ({score}/10) - Time waster")
+                        self.interact_with_video(video, "not_interested")
+                        
+                except Exception as e:
+                    print(f"❌ Analysis failed: {e}")
+                    print("~ Skipping video")
                 
                 processed += 1
                 
                 # Longer delay after API calls to avoid rate limiting
-                time.sleep(random.uniform(3, 6))
+                time.sleep(random.uniform(*self.config.ACTION_DELAY))
             
             if not new_videos_found:
                 print("No new videos found, scrolling...")
             
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(3)
+            time.sleep(self.config.SCROLL_DELAY)
             scroll_count += 1
         
         print(f"\nProcessed {processed} videos")
         print(f"API calls made: {self.api_call_count}")
+        print(f"Elite searches generated: {len(self.generated_searches)}")
     
     def close(self):
         self.logger.info("Closing browser")
@@ -588,20 +846,24 @@ Respond with just a number 1-10."""
             pass
 
 def main():
+    # Import configuration
     try:
-        from config import GEMINI_API_KEY
-    except:
-        GEMINI_API_KEY = "your_gemini_api_key_here"
+        import config
+        print(f"Using LLM Provider: {config.LLM_PROVIDER}")
+    except ImportError:
+        print("Please create config.py file with your settings")
+        return
     
-    if GEMINI_API_KEY == "your_gemini_api_key_here":
+    # Validate configuration
+    if config.LLM_PROVIDER in ["gemini", "both"] and config.GEMINI_API_KEY == "your_gemini_api_key_here":
         print("Please update GEMINI_API_KEY in config.py")
         return
     
-    optimizer = YouTubeFeedOptimizer(GEMINI_API_KEY)
+    optimizer = YouTubeFeedOptimizer(config)
     
     try:
         print("Starting YouTube feed optimization...")
-        optimizer.optimize_feed(max_videos=15)
+        optimizer.optimize_feed(max_videos=config.MAX_VIDEOS_TO_PROCESS)
         
     except KeyboardInterrupt:
         print("\nStopped by user")
